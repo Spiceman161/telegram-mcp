@@ -59,21 +59,109 @@ def json_serializer(obj):
 
 load_dotenv()
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+_TELEGRAM_API_ID_RAW = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
+
+if not _TELEGRAM_API_ID_RAW or not TELEGRAM_API_HASH:
+    # Keep startup failures readable; avoid stack traces from int(None) etc.
+    raise SystemExit(
+        "Missing Telegram credentials. Set TELEGRAM_API_ID and TELEGRAM_API_HASH (see .env.example)."
+    )
+
+TELEGRAM_API_ID = int(_TELEGRAM_API_ID_RAW)
 
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
 mcp = FastMCP("telegram")
 
-if SESSION_STRING:
-    # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+# --- Optional network + client profile settings (env-driven) ---
+# Proxy env:
+#   TG_PROXY_TYPE=socks5|socks4|http
+#   TG_PROXY_HOST, TG_PROXY_PORT
+#   TG_PROXY_USER, TG_PROXY_PASS (optional)
+#   TG_PROXY_RDNS=true|false (default true)
+#
+# Client profile env (stable across restarts):
+#   TG_LANG_CODE (default: en)
+#   TG_SYSTEM_LANG_CODE (default: en-US)
+#   TG_DEVICE_MODEL (default: PC)
+#   TG_SYSTEM_VERSION (default: Linux)
+#   TG_APP_VERSION (default: 1.0)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def build_proxy():
+    ptype = os.getenv("TG_PROXY_TYPE")
+    if not ptype:
+        return None
+    host = os.getenv("TG_PROXY_HOST")
+    port = os.getenv("TG_PROXY_PORT")
+    if not host or not port:
+        return None
+    user = os.getenv("TG_PROXY_USER") or None
+    pwd = os.getenv("TG_PROXY_PASS") or None
+    rdns = _env_bool("TG_PROXY_RDNS", default=True)
+
+    # Telethon expects a PySocks-style proxy tuple:
+    # (proxy_type, addr, port, rdns, username, password)
+    return (ptype, host, int(port), rdns, user, pwd)
+
+
+def build_client_profile_kwargs():
+    return {
+        "lang_code": os.getenv("TG_LANG_CODE", "en"),
+        "system_lang_code": os.getenv("TG_SYSTEM_LANG_CODE", "en-US"),
+        "device_model": os.getenv("TG_DEVICE_MODEL", "PC"),
+        "system_version": os.getenv("TG_SYSTEM_VERSION", "Linux"),
+        "app_version": os.getenv("TG_APP_VERSION", "1.0"),
+    }
+
+
+def create_telegram_client():
+    proxy = build_proxy()
+    profile = build_client_profile_kwargs()
+
+    # Build kwargs and gracefully degrade if some Telethon versions reject fields.
+    kwargs = {"proxy": proxy, **profile}
+
+    def _make(**kw):
+        if SESSION_STRING:
+            return TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH, **kw)
+        return TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kw)
+
+    try:
+        return _make(**kwargs)
+    except TypeError:
+        # Older Telethon: drop profile fields, keep proxy.
+        return _make(proxy=proxy)
+
+
+client = create_telegram_client()
+
+# Startup diagnostics (never log secrets)
+_proxy = build_proxy()
+_profile = build_client_profile_kwargs()
+if _proxy:
+    _ptype, _host, _port, _rdns, _user, _pwd = _proxy
+    print(
+        f"Proxy: {_ptype} {_host}:{_port} rdns={bool(_rdns)} user={'yes' if _user else 'no'}"
+    )
 else:
-    # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    print("Proxy: disabled")
+
+print(
+    "Client profile: "
+    f"lang={_profile.get('lang_code')} system_lang={_profile.get('system_lang_code')} "
+    f"device={_profile.get('device_model')} system={_profile.get('system_version')} app={_profile.get('app_version')}"
+)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -112,6 +200,33 @@ except Exception as log_error:
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+
+# Expose a small, non-secret runtime config for debugging
+@mcp.tool()
+def get_runtime_config() -> str:
+    """Return non-secret runtime settings (proxy enabled + client profile)."""
+    proxy = build_proxy()
+    profile = build_client_profile_kwargs()
+    payload = {
+        "proxy": {
+            "enabled": bool(proxy),
+            "type": proxy[0] if proxy else None,
+            "host": proxy[1] if proxy else None,
+            "port": proxy[2] if proxy else None,
+            "rdns": bool(proxy[3]) if proxy else None,
+            "hasAuth": bool(proxy[4]) if proxy else False,
+        },
+        "clientProfile": {
+            "lang_code": profile.get("lang_code"),
+            "system_lang_code": profile.get("system_lang_code"),
+            "device_model": profile.get("device_model"),
+            "system_version": profile.get("system_version"),
+            "app_version": profile.get("app_version"),
+        },
+        "timezone": os.getenv("TZ"),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # Error code prefix mapping for better error tracing
