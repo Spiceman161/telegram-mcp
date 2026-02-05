@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import logging
 import mimetypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
 
@@ -40,7 +40,7 @@ import re
 import contextvars
 from functools import wraps
 import telethon.errors.rpcerrorlist
-from acl import load_policy as _load_policy, acl_check as _acl_check
+from acl import load_policy as _load_policy, acl_check as _acl_check, check_file_size as _check_file_size
 
 _current_sender_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "telegram_mcp.sender_id", default=None
@@ -192,6 +192,30 @@ def create_telegram_client():
 
 client = create_telegram_client()
 
+# ---------------------------------------------------------------------------
+# Connection status monitoring
+# ---------------------------------------------------------------------------
+_last_connected_check = time.time()
+_CHECK_INTERVAL = 300  # 5 minutes
+
+
+async def _check_connection():
+    """Periodically check connectivity and log disconnect events."""
+    global _last_connected_check
+    now = time.time()
+    if now - _last_connected_check < _CHECK_INTERVAL:
+        return
+
+    _last_connected_check = now
+    if not client.is_connected():
+        _disconnect_logger.warning(
+            "telegram_disconnected",
+            extra={
+                "event": "disconnect",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
 # Startup diagnostics (never log secrets)
 _proxy = build_proxy()
 _profile = build_client_profile_kwargs()
@@ -267,6 +291,38 @@ try:
     _acl_logger.addHandler(_acl_file_handler)
 except Exception as _acl_log_err:
     print(f"WARNING: ACL audit log setup failed: {_acl_log_err}")
+
+# ---------------------------------------------------------------------------
+# FILES operations logger — JSON-only audit trail
+# ---------------------------------------------------------------------------
+_files_logger = logging.getLogger("telegram_mcp.files")
+_files_logger.setLevel(logging.INFO)
+_files_logger.propagate = False
+
+try:
+    _files_log_path = os.path.join(script_dir, "files_audit.log")
+    _files_file_handler = logging.FileHandler(_files_log_path, mode="a")
+    _files_file_handler.setLevel(logging.INFO)
+    _files_file_handler.setFormatter(json_formatter)
+    _files_logger.addHandler(_files_file_handler)
+except Exception as _files_log_err:
+    print(f"WARNING: Files audit log setup failed: {_files_log_err}")
+
+# ---------------------------------------------------------------------------
+# Disconnect event logger — JSON-only, connection status monitoring
+# ---------------------------------------------------------------------------
+_disconnect_logger = logging.getLogger("telegram_mcp.disconnect")
+_disconnect_logger.setLevel(logging.WARNING)
+_disconnect_logger.propagate = False
+
+try:
+    _disconnect_log_path = os.path.join(script_dir, "disconnect_events.log")
+    _disconnect_file_handler = logging.FileHandler(_disconnect_log_path, mode="a")
+    _disconnect_file_handler.setLevel(logging.WARNING)
+    _disconnect_file_handler.setFormatter(json_formatter)
+    _disconnect_logger.addHandler(_disconnect_file_handler)
+except Exception as _disconnect_log_err:
+    print(f"WARNING: Disconnect logger setup failed: {_disconnect_log_err}")
 
 # ---------------------------------------------------------------------------
 # ACL policy — loaded once at module init, cached for lifetime
@@ -2124,6 +2180,40 @@ async def send_file(
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
             return f"File is not readable: {file_path}"
+
+        # Check file size limit
+        allowed, reason = _check_file_size(_acl_policy, file_path)
+        if not allowed:
+            _files_logger.warning(
+                "file_size_exceeded",
+                extra={
+                    "event": "file_size_exceeded",
+                    "operation": "send_file",
+                    "file_path": file_path,
+                    "reason": reason,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return f"File size limit exceeded: {reason}"
+
+        # Check connection status
+        await _check_connection()
+
+        # Log file operation
+        _files_logger.info(
+            "file_operation",
+            extra={
+                "event": "file_operation",
+                "operation": "send_file",
+                "file_path": file_path,
+                "file_size": os.path.getsize(file_path),
+                "chat_id": chat_id,
+                "sender_id": _current_sender_id.get(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, caption=caption)
         return f"File sent to chat {chat_id}."
@@ -2159,7 +2249,27 @@ async def download_media(
         dir_path = os.path.dirname(file_path) or "."
         if not os.access(dir_path, os.W_OK):
             return f"Directory not writable: {dir_path}"
+
+        # Check connection status
+        await _check_connection()
+
         await client.download_media(msg, file=file_path)
+
+        # Log file operation after successful download
+        if os.path.isfile(file_path):
+            _files_logger.info(
+                "file_operation",
+                extra={
+                    "event": "file_operation",
+                    "operation": "download_media",
+                    "file_path": file_path,
+                    "file_size": os.path.getsize(file_path),
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         if not os.path.isfile(file_path):
             return f"Download failed: file not created at {file_path}"
         return f"Media downloaded to {file_path}."
@@ -2215,6 +2325,43 @@ async def set_profile_photo(file_path: str) -> str:
     Set a new profile photo.
     """
     try:
+        if not os.path.isfile(file_path):
+            return f"File not found: {file_path}"
+        if not os.access(file_path, os.R_OK):
+            return f"File is not readable: {file_path}"
+
+        # Check file size limit
+        allowed, reason = _check_file_size(_acl_policy, file_path)
+        if not allowed:
+            _files_logger.warning(
+                "file_size_exceeded",
+                extra={
+                    "event": "file_size_exceeded",
+                    "operation": "set_profile_photo",
+                    "file_path": file_path,
+                    "reason": reason,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return f"File size limit exceeded: {reason}"
+
+        # Check connection status
+        await _check_connection()
+
+        # Log file operation
+        _files_logger.info(
+            "file_operation",
+            extra={
+                "event": "file_operation",
+                "operation": "set_profile_photo",
+                "file_path": file_path,
+                "file_size": os.path.getsize(file_path),
+                "sender_id": _current_sender_id.get(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
         await client(
             functions.photos.UploadProfilePhotoRequest(
                 file=await client.upload_file(file_path)
@@ -2538,6 +2685,39 @@ async def edit_chat_photo(chat_id: Union[int, str], file_path: str) -> str:
             return f"Photo file not found: {file_path}"
         if not os.access(file_path, os.R_OK):
             return f"Photo file not readable: {file_path}"
+
+        # Check file size limit
+        allowed, reason = _check_file_size(_acl_policy, file_path)
+        if not allowed:
+            _files_logger.warning(
+                "file_size_exceeded",
+                extra={
+                    "event": "file_size_exceeded",
+                    "operation": "edit_chat_photo",
+                    "file_path": file_path,
+                    "reason": reason,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return f"File size limit exceeded: {reason}"
+
+        # Check connection status
+        await _check_connection()
+
+        # Log file operation
+        _files_logger.info(
+            "file_operation",
+            extra={
+                "event": "file_operation",
+                "operation": "edit_chat_photo",
+                "file_path": file_path,
+                "file_size": os.path.getsize(file_path),
+                "chat_id": chat_id,
+                "sender_id": _current_sender_id.get(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
         entity = await client.get_entity(chat_id)
         uploaded_file = await client.upload_file(file_path)
@@ -3167,6 +3347,39 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
         ):
             return "Voice file must be .ogg or .opus format."
 
+        # Check file size limit
+        allowed, reason = _check_file_size(_acl_policy, file_path)
+        if not allowed:
+            _files_logger.warning(
+                "file_size_exceeded",
+                extra={
+                    "event": "file_size_exceeded",
+                    "operation": "send_voice",
+                    "file_path": file_path,
+                    "reason": reason,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return f"File size limit exceeded: {reason}"
+
+        # Check connection status
+        await _check_connection()
+
+        # Log file operation
+        _files_logger.info(
+            "file_operation",
+            extra={
+                "event": "file_operation",
+                "operation": "send_voice",
+                "file_path": file_path,
+                "file_size": os.path.getsize(file_path),
+                "chat_id": chat_id,
+                "sender_id": _current_sender_id.get(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, voice_note=True)
         return f"Voice message sent to chat {chat_id}."
@@ -3619,6 +3832,39 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
             return f"Sticker file is not readable: {file_path}"
         if not file_path.lower().endswith(".webp"):
             return "Sticker file must be a .webp file."
+
+        # Check file size limit
+        allowed, reason = _check_file_size(_acl_policy, file_path)
+        if not allowed:
+            _files_logger.warning(
+                "file_size_exceeded",
+                extra={
+                    "event": "file_size_exceeded",
+                    "operation": "send_sticker",
+                    "file_path": file_path,
+                    "reason": reason,
+                    "sender_id": _current_sender_id.get(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return f"File size limit exceeded: {reason}"
+
+        # Check connection status
+        await _check_connection()
+
+        # Log file operation
+        _files_logger.info(
+            "file_operation",
+            extra={
+                "event": "file_operation",
+                "operation": "send_sticker",
+                "file_path": file_path,
+                "file_size": os.path.getsize(file_path),
+                "chat_id": chat_id,
+                "sender_id": _current_sender_id.get(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
         entity = await client.get_entity(chat_id)
         await client.send_file(entity, file_path, force_document=False)

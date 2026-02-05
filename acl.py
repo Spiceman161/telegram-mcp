@@ -430,3 +430,35 @@ def load_policy(path: Optional[str] = None) -> dict:
             exc,
         )
         return dict(_DENY_ALL)
+
+
+# ---------------------------------------------------------------------------
+# File size limit check
+# ---------------------------------------------------------------------------
+
+
+def check_file_size(policy: dict, file_path: str) -> tuple[bool, str]:
+    """Check if file size is within policy limits.
+
+    Args:
+        policy: ACL policy dict
+        file_path: Absolute path to file
+
+    Returns:
+        (allowed: bool, reason: str)
+    """
+    max_size_mb = policy.get("max_file_size_mb")
+    if max_size_mb is None:
+        return (True, "no limit set")
+
+    if not os.path.isfile(file_path):
+        return (False, "file not found")
+
+    size_bytes = os.path.getsize(file_path)
+    size_mb = size_bytes / (1024 * 1024)
+    max_bytes = max_size_mb * 1024 * 1024
+
+    if size_bytes > max_bytes:
+        return (False, f"file size {size_mb:.1f}MB exceeds limit {max_size_mb}MB")
+
+    return (True, f"size {size_mb:.1f}MB within limit")
