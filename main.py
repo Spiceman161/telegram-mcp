@@ -210,14 +210,15 @@ print(
 )
 
 # Setup robust logging with both file and console output
+# Уровень настраивается через переменную окружения: MCP_LOG_LEVEL=INFO | DEBUG | WARNING | ERROR
+_log_level = getattr(logging, os.getenv("MCP_LOG_LEVEL", "ERROR").upper(), logging.ERROR)
+
 logger = logging.getLogger("telegram_mcp")
-logger.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for debugging
+logger.setLevel(_log_level)
 
 # Create console handler
 console_handler = logging.StreamHandler()
-console_handler.setLevel(
-    logging.ERROR
-)  # Set to ERROR for production, INFO for debugging
+console_handler.setLevel(_log_level)
 
 # Create file handler with absolute path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -225,7 +226,7 @@ log_file_path = os.path.join(script_dir, "mcp_errors.log")
 
 try:
     file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
-    file_handler.setLevel(logging.ERROR)
+    file_handler.setLevel(_log_level)
 
     # Create formatters
     # Console formatter remains in the old format
