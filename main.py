@@ -37,8 +37,14 @@ from telethon.tl.types import (
     TextWithEntities,
 )
 import re
+import contextvars
 from functools import wraps
 import telethon.errors.rpcerrorlist
+from acl import load_policy as _load_policy, acl_check as _acl_check
+
+_current_sender_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "telegram_mcp.sender_id", default=None
+)
 
 
 class ValidationError(Exception):
@@ -99,19 +105,55 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def build_proxy():
-    ptype = os.getenv("TG_PROXY_TYPE")
-    if not ptype:
+    """Build a Telethon/PySocks proxy tuple from env.
+
+    Expected env:
+      TG_PROXY_TYPE=socks5|socks4|http
+      TG_PROXY_HOST, TG_PROXY_PORT
+      TG_PROXY_USER, TG_PROXY_PASS (optional)
+      TG_PROXY_RDNS=true|false (default true)
+
+    Notes:
+      Telethon uses a PySocks-style proxy tuple:
+        (proxy_type, addr, port, rdns, username, password)
+      where proxy_type is usually an int constant from the `socks` module.
+    """
+
+    ptype_raw = (os.getenv("TG_PROXY_TYPE") or "").strip().lower()
+    if not ptype_raw:
         return None
+
     host = os.getenv("TG_PROXY_HOST")
     port = os.getenv("TG_PROXY_PORT")
     if not host or not port:
         return None
+
     user = os.getenv("TG_PROXY_USER") or None
     pwd = os.getenv("TG_PROXY_PASS") or None
     rdns = _env_bool("TG_PROXY_RDNS", default=True)
 
-    # Telethon expects a PySocks-style proxy tuple:
-    # (proxy_type, addr, port, rdns, username, password)
+    # Map string -> PySocks constant when available.
+    # If PySocks is not installed and proxy is enabled, fail fast with a clear message.
+    ptype = ptype_raw
+    try:
+        import socks  # PySocks
+
+        _map = {
+            "socks5": socks.SOCKS5,
+            "socks4": socks.SOCKS4,
+            "http": socks.HTTP,
+        }
+        if ptype_raw not in _map:
+            raise SystemExit(
+                f"Invalid TG_PROXY_TYPE={ptype_raw!r}. Use one of: socks5, socks4, http."
+            )
+        ptype = _map[ptype_raw]
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "Proxy is enabled (TG_PROXY_TYPE is set) but PySocks is not installed. "
+            "Install it: pip install pysocks"
+        )
+
     return (ptype, host, int(port), rdns, user, pwd)
 
 
@@ -134,7 +176,9 @@ def create_telegram_client():
 
     def _make(**kw):
         if SESSION_STRING:
-            return TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH, **kw)
+            return TelegramClient(
+                StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH, **kw
+            )
         return TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kw)
 
     try:
@@ -151,9 +195,7 @@ _proxy = build_proxy()
 _profile = build_client_profile_kwargs()
 if _proxy:
     _ptype, _host, _port, _rdns, _user, _pwd = _proxy
-    print(
-        f"Proxy: {_ptype} {_host}:{_port} rdns={bool(_rdns)} user={'yes' if _user else 'no'}"
-    )
+    print(f"Proxy: {_ptype} {_host}:{_port} rdns={bool(_rdns)} user={'yes' if _user else 'no'}")
 else:
     print("Proxy: disabled")
 
@@ -200,6 +242,27 @@ except Exception as log_error:
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+# ---------------------------------------------------------------------------
+# ACL audit logger — JSON-only, one entry per allow/deny decision
+# ---------------------------------------------------------------------------
+_acl_logger = logging.getLogger("telegram_mcp.acl")
+_acl_logger.setLevel(logging.INFO)
+_acl_logger.propagate = False
+
+try:
+    _acl_log_path = os.path.join(script_dir, "acl_audit.log")
+    _acl_file_handler = logging.FileHandler(_acl_log_path, mode="a")
+    _acl_file_handler.setLevel(logging.INFO)
+    _acl_file_handler.setFormatter(json_formatter)
+    _acl_logger.addHandler(_acl_file_handler)
+except Exception as _acl_log_err:
+    print(f"WARNING: ACL audit log setup failed: {_acl_log_err}")
+
+# ---------------------------------------------------------------------------
+# ACL policy — loaded once at module init, cached for lifetime
+# ---------------------------------------------------------------------------
+_acl_policy = _load_policy()
 
 
 # Expose a small, non-secret runtime config for debugging
@@ -377,6 +440,80 @@ def validate_id(*param_names_to_validate):
     return decorator
 
 
+# ---------------------------------------------------------------------------
+# ACL guard decorator
+# ---------------------------------------------------------------------------
+# Target-extraction keys, checked in priority order; first non-None wins.
+_ACL_TARGET_KEYS = ("chat_id", "user_id", "channel", "group_id", "contact_id", "to_chat_id")
+
+
+def acl_guard(func):
+    """Wrap an MCP tool so every invocation is checked against the ACL policy.
+
+    Must sit *inside* @validate_id (if present) so it reads already-normalised
+    int IDs, and *inside* @mcp.tool so FastMCP still sees the original signature.
+
+    Stacking for tools WITH validate_id::
+
+        @mcp.tool(...)
+        @validate_id("chat_id")
+        @acl_guard
+        async def my_tool(...): ...
+
+    Stacking for tools WITHOUT validate_id::
+
+        @mcp.tool(...)
+        @acl_guard
+        async def my_tool(...): ...
+    """
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        sender_id = _current_sender_id.get()
+
+        # Extract target from kwargs by priority.
+        # validate_id (if present) has already converted numeric strings to int.
+        # A remaining str value is a Telegram username; acl_check compares against
+        # int-based policy lists and would deny-by-mismatch with no useful reason.
+        # Treat unresolved usernames as "no target" so ADMIN falls through to the
+        # "admin, no target" allow; log for operator visibility.
+        target = None
+        for key in _ACL_TARGET_KEYS:
+            if key in kwargs and kwargs[key] is not None:
+                target = kwargs[key]
+                break
+
+        if isinstance(target, str):
+            _acl_logger.warning(
+                "acl_guard: unresolved username target %r in %s — treated as no target",
+                target,
+                func.__name__,
+            )
+            target = None
+
+        result = _acl_check(_acl_policy, func.__name__, sender_id, target)
+
+        # Audit log — always, for both allowed and denied decisions
+        _acl_logger.info(
+            "acl_decision",
+            extra={
+                "event": "acl_decision",
+                "tool": func.__name__,
+                "sender_id": sender_id,
+                "target_chat_id": target,
+                "allowed": result.allowed,
+                "reason": result.reason,
+            },
+        )
+
+        if not result.allowed:
+            return f"[ACL DENIED] {result.reason}"
+
+        return await func(*args, **kwargs)
+
+    return wrapper
+
+
 def format_entity(entity) -> Dict[str, Any]:
     """Helper function to format entity information consistently."""
     result = {"id": entity.id}
@@ -454,6 +591,7 @@ def get_engagement_info(message) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
     Get a paginated list of chats.
@@ -481,6 +619,7 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
     """
     Get paginated messages from a specific chat.
@@ -518,6 +657,7 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     annotations=ToolAnnotations(title="Send Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def send_message(chat_id: Union[int, str], message: str) -> str:
     """
     Send a message to a specific chat.
@@ -542,6 +682,7 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
     )
 )
 @validate_id("channel")
+@acl_guard
 async def subscribe_public_channel(channel: Union[int, str]) -> str:
     """
     Subscribe (join) to a public channel or supergroup by username or ID.
@@ -564,6 +705,7 @@ async def subscribe_public_channel(channel: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="List Inline Buttons", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def list_inline_buttons(
     chat_id: Union[int, str], message_id: Optional[Union[int, str]] = None, limit: int = 20
 ) -> str:
@@ -632,6 +774,7 @@ async def list_inline_buttons(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def press_inline_button(
     chat_id: Union[int, str],
     message_id: Optional[Union[int, str]] = None,
@@ -748,6 +891,7 @@ async def press_inline_button(
 @mcp.tool(
     annotations=ToolAnnotations(title="List Contacts", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def list_contacts() -> str:
     """
     List all contacts in your Telegram account.
@@ -776,6 +920,7 @@ async def list_contacts() -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Search Contacts", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def search_contacts(query: str) -> str:
     """
     Search for contacts by name, username, or phone number using Telethon's SearchRequest.
@@ -806,6 +951,7 @@ async def search_contacts(query: str) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Contact Ids", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def get_contact_ids() -> str:
     """
     Get all contact IDs in your Telegram account.
@@ -823,6 +969,7 @@ async def get_contact_ids() -> str:
     annotations=ToolAnnotations(title="List Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def list_messages(
     chat_id: Union[int, str],
     limit: int = 20,
@@ -947,6 +1094,7 @@ async def list_messages(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Topics", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def list_topics(
     chat_id: int,
     limit: int = 200,
@@ -1034,6 +1182,7 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def list_chats(chat_type: str = None, limit: int = 20) -> str:
     """
     List available chats with metadata.
@@ -1107,6 +1256,7 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chat", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def get_chat(chat_id: Union[int, str]) -> str:
     """
     Get detailed information about a specific chat.
@@ -1191,6 +1341,7 @@ async def get_chat(chat_id: Union[int, str]) -> str:
         title="Get Direct Chat By Contact", openWorldHint=True, readOnlyHint=True
     )
 )
+@acl_guard
 async def get_direct_chat_by_contact(contact_query: str) -> str:
     """
     Find a direct chat with a specific contact by name, username, or phone.
@@ -1249,6 +1400,7 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
     annotations=ToolAnnotations(title="Get Contact Chats", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("contact_id")
+@acl_guard
 async def get_contact_chats(contact_id: Union[int, str]) -> str:
     """
     List all chats involving a specific contact.
@@ -1306,6 +1458,7 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
     )
 )
 @validate_id("contact_id")
+@acl_guard
 async def get_last_interaction(contact_id: Union[int, str]) -> str:
     """
     Get the most recent message with a contact.
@@ -1345,6 +1498,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Message Context", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_message_context(
     chat_id: Union[int, str], message_id: int, context_size: int = 3
 ) -> str:
@@ -1415,6 +1569,7 @@ async def get_message_context(
         title="Add Contact", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def add_contact(phone: str, first_name: str, last_name: str = "") -> str:
     """
     Add a new contact to your Telegram account.
@@ -1476,6 +1631,7 @@ async def add_contact(phone: str, first_name: str, last_name: str = "") -> str:
     )
 )
 @validate_id("user_id")
+@acl_guard
 async def delete_contact(user_id: Union[int, str]) -> str:
     """
     Delete a contact by user ID.
@@ -1496,6 +1652,7 @@ async def delete_contact(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@acl_guard
 async def block_user(user_id: Union[int, str]) -> str:
     """
     Block a user by user ID.
@@ -1516,6 +1673,7 @@ async def block_user(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@acl_guard
 async def unblock_user(user_id: Union[int, str]) -> str:
     """
     Unblock a user by user ID.
@@ -1546,6 +1704,7 @@ async def get_me() -> str:
     annotations=ToolAnnotations(title="Create Group", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("user_ids")
+@acl_guard
 async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
     """
     Create a new group or supergroup and add users.
@@ -1609,6 +1768,7 @@ async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
     )
 )
 @validate_id("group_id", "user_ids")
+@acl_guard
 async def invite_to_group(group_id: Union[int, str], user_ids: List[Union[int, str]]) -> str:
     """
     Invite users to a group or channel.
@@ -1663,6 +1823,7 @@ async def invite_to_group(group_id: Union[int, str], user_ids: List[Union[int, s
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def leave_chat(chat_id: Union[int, str]) -> str:
     """
     Leave a group or channel by chat ID.
@@ -1746,6 +1907,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Participants", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_participants(chat_id: Union[int, str]) -> str:
     """
     List all participants in a group or channel.
@@ -1765,6 +1927,7 @@ async def get_participants(chat_id: Union[int, str]) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def send_file(chat_id: Union[int, str], file_path: str, caption: str = None) -> str:
     """
     Send a file to a chat.
@@ -1791,6 +1954,7 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
     annotations=ToolAnnotations(title="Download Media", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def download_media(chat_id: Union[int, str], message_id: int, file_path: str) -> str:
     """
     Download media from a message in a chat.
@@ -1827,6 +1991,7 @@ async def download_media(chat_id: Union[int, str], message_id: int, file_path: s
         title="Update Profile", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def update_profile(first_name: str = None, last_name: str = None, about: str = None) -> str:
     """
     Update your profile information (name, bio).
@@ -1849,6 +2014,7 @@ async def update_profile(first_name: str = None, last_name: str = None, about: s
         title="Set Profile Photo", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def set_profile_photo(file_path: str) -> str:
     """
     Set a new profile photo.
@@ -1867,6 +2033,7 @@ async def set_profile_photo(file_path: str) -> str:
         title="Delete Profile Photo", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def delete_profile_photo() -> str:
     """
     Delete your current profile photo.
@@ -1888,6 +2055,7 @@ async def delete_profile_photo() -> str:
         title="Get Privacy Settings", openWorldHint=True, readOnlyHint=True
     )
 )
+@acl_guard
 async def get_privacy_settings() -> str:
     """
     Get your privacy settings for last seen status.
@@ -1917,18 +2085,30 @@ async def get_privacy_settings() -> str:
     )
 )
 @validate_id("allow_users", "disallow_users")
+@acl_guard
 async def set_privacy_settings(
     key: str,
+    mode: str = "allow_all",
     allow_users: Optional[List[Union[int, str]]] = None,
     disallow_users: Optional[List[Union[int, str]]] = None,
 ) -> str:
-    """
-    Set privacy settings (e.g., last seen, phone, etc.).
+    """Set privacy settings.
+
+    Supported keys:
+      - status         (last seen / online)
+      - phone          (phone number visibility)
+      - profile_photo  (profile photo visibility)
+
+    Supported modes:
+      - allow_all          : Everybody (optionally + disallow_users)
+      - disallow_all       : Nobody (optionally + allow_users exceptions)
+      - allow_users        : Only allow_users (+ optional disallow_users)
 
     Args:
-        key: The privacy setting to modify ('status' for last seen, 'phone', 'profile_photo', etc.)
-        allow_users: List of user IDs or usernames to allow
-        disallow_users: List of user IDs or usernames to disallow
+        key: The privacy setting to modify.
+        mode: One of allow_all|disallow_all|allow_users.
+        allow_users: List of user IDs or usernames to allow (used for allow_users or disallow_all exceptions)
+        disallow_users: List of user IDs or usernames to disallow (used with allow_all / allow_users)
     """
     try:
         # Import needed types
@@ -1958,43 +2138,43 @@ async def set_privacy_settings(
         # Prepare the rules
         rules = []
 
-        # Process allow rules
-        if allow_users is None or len(allow_users) == 0:
-            # If no specific users to allow, allow everyone by default
+        mode_norm = (mode or "").strip().lower()
+        if mode_norm not in ("allow_all", "disallow_all", "allow_users"):
+            return f"Error: Unsupported mode '{mode}'. Supported modes: allow_all, disallow_all, allow_users"
+
+        # Helper to resolve user entities
+        async def _resolve_entities(ids: Optional[List[Union[int, str]]]):
+            entities = []
+            if not ids:
+                return entities
+            for user_id in ids:
+                try:
+                    user = await client.get_entity(user_id)
+                    entities.append(user)
+                except Exception as user_err:
+                    logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
+            return entities
+
+        # Mode-specific base rules
+        if mode_norm == "allow_all":
             rules.append(InputPrivacyValueAllowAll())
-        else:
-            # Convert user IDs to InputUser entities
-            try:
-                allow_entities = []
-                for user_id in allow_users:
-                    try:
-                        user = await client.get_entity(user_id)
-                        allow_entities.append(user)
-                    except Exception as user_err:
-                        logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
+        elif mode_norm == "disallow_all":
+            rules.append(InputPrivacyValueDisallowAll())
+            # Allow exceptions ("nobody except")
+            allow_entities = await _resolve_entities(allow_users)
+            if allow_entities:
+                rules.append(InputPrivacyValueAllowUsers(users=allow_entities))
+        else:  # allow_users
+            allow_entities = await _resolve_entities(allow_users)
+            if not allow_entities:
+                return "Error: mode=allow_users requires a non-empty allow_users list."
+            rules.append(InputPrivacyValueAllowUsers(users=allow_entities))
 
-                if allow_entities:
-                    rules.append(InputPrivacyValueAllowUsers(users=allow_entities))
-            except Exception as allow_err:
-                logger.error(f"Error processing allowed users: {allow_err}")
-                return log_and_format_error("set_privacy_settings", allow_err, key=key)
-
-        # Process disallow rules
-        if disallow_users and len(disallow_users) > 0:
-            try:
-                disallow_entities = []
-                for user_id in disallow_users:
-                    try:
-                        user = await client.get_entity(user_id)
-                        disallow_entities.append(user)
-                    except Exception as user_err:
-                        logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
-
-                if disallow_entities:
-                    rules.append(InputPrivacyValueDisallowUsers(users=disallow_entities))
-            except Exception as disallow_err:
-                logger.error(f"Error processing disallowed users: {disallow_err}")
-                return log_and_format_error("set_privacy_settings", disallow_err, key=key)
+        # Disallow list is meaningful only for allow_all / allow_users
+        if mode_norm in ("allow_all", "allow_users"):
+            disallow_entities = await _resolve_entities(disallow_users)
+            if disallow_entities:
+                rules.append(InputPrivacyValueDisallowUsers(users=disallow_entities))
 
         # Apply the privacy settings
         try:
@@ -2015,6 +2195,7 @@ async def set_privacy_settings(
 @mcp.tool(
     annotations=ToolAnnotations(title="Import Contacts", openWorldHint=True, destructiveHint=True)
 )
+@acl_guard
 async def import_contacts(contacts: list) -> str:
     """
     Import a list of contacts. Each contact should be a dict with phone, first_name, last_name.
@@ -2038,6 +2219,7 @@ async def import_contacts(contacts: list) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Export Contacts", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def export_contacts() -> str:
     """
     Export all contacts as a JSON string.
@@ -2053,6 +2235,7 @@ async def export_contacts() -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Blocked Users", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def get_blocked_users() -> str:
     """
     Get a list of blocked users.
@@ -2067,6 +2250,7 @@ async def get_blocked_users() -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Create Channel", openWorldHint=True, destructiveHint=True)
 )
+@acl_guard
 async def create_channel(title: str, about: str = "", megagroup: bool = False) -> str:
     """
     Create a new channel or supergroup.
@@ -2088,6 +2272,7 @@ async def create_channel(title: str, about: str = "", megagroup: bool = False) -
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def edit_chat_title(chat_id: Union[int, str], title: str) -> str:
     """
     Edit the title of a chat, group, or channel.
@@ -2112,6 +2297,7 @@ async def edit_chat_title(chat_id: Union[int, str], title: str) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def edit_chat_photo(chat_id: Union[int, str], file_path: str) -> str:
     """
     Edit the photo of a chat, group, or channel. Requires a file path to an image.
@@ -2150,6 +2336,7 @@ async def edit_chat_photo(chat_id: Union[int, str], file_path: str) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def delete_chat_photo(chat_id: Union[int, str]) -> str:
     """
     Delete the photo of a chat, group, or channel.
@@ -2183,6 +2370,7 @@ async def delete_chat_photo(chat_id: Union[int, str]) -> str:
     )
 )
 @validate_id("group_id", "user_id")
+@acl_guard
 async def promote_admin(
     group_id: Union[int, str], user_id: Union[int, str], rights: dict = None
 ) -> str:
@@ -2254,6 +2442,7 @@ async def promote_admin(
     )
 )
 @validate_id("group_id", "user_id")
+@acl_guard
 async def demote_admin(group_id: Union[int, str], user_id: Union[int, str]) -> str:
     """
     Demote a user from admin in a group/channel.
@@ -2307,6 +2496,7 @@ async def demote_admin(group_id: Union[int, str], user_id: Union[int, str]) -> s
     )
 )
 @validate_id("chat_id", "user_id")
+@acl_guard
 async def ban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
     """
     Ban a user from a group or channel.
@@ -2358,6 +2548,7 @@ async def ban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("chat_id", "user_id")
+@acl_guard
 async def unban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
     """
     Unban a user from a group or channel.
@@ -2405,6 +2596,7 @@ async def unban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Admins", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def get_admins(chat_id: Union[int, str]) -> str:
     """
     Get all admins in a group or channel.
@@ -2426,6 +2618,7 @@ async def get_admins(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Banned Users", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_banned_users(chat_id: Union[int, str]) -> str:
     """
     Get all banned users in a group or channel.
@@ -2449,6 +2642,7 @@ async def get_banned_users(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Invite Link", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_invite_link(chat_id: Union[int, str]) -> str:
     """
     Get the invite link for a group or channel.
@@ -2496,6 +2690,7 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
         title="Join Chat By Link", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def join_chat_by_link(link: str) -> str:
     """
     Join a chat by invite link.
@@ -2543,6 +2738,7 @@ async def join_chat_by_link(link: str) -> str:
     annotations=ToolAnnotations(title="Export Chat Invite", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def export_chat_invite(chat_id: Union[int, str]) -> str:
     """
     Export a chat invite link.
@@ -2581,6 +2777,7 @@ async def export_chat_invite(chat_id: Union[int, str]) -> str:
         title="Import Chat Invite", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def import_chat_invite(hash: str) -> str:
     """
     Import a chat invite by hash.
@@ -2641,6 +2838,7 @@ async def import_chat_invite(hash: str) -> str:
     annotations=ToolAnnotations(title="Send Voice", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
     """
     Send a voice message to a chat. File must be an OGG/OPUS voice note.
@@ -2677,6 +2875,7 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
     annotations=ToolAnnotations(title="Forward Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("from_chat_id", "to_chat_id")
+@acl_guard
 async def forward_message(
     from_chat_id: Union[int, str], message_id: int, to_chat_id: Union[int, str]
 ) -> str:
@@ -2704,6 +2903,7 @@ async def forward_message(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str) -> str:
     """
     Edit a message you sent.
@@ -2724,6 +2924,7 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Delete a message by ID.
@@ -2742,6 +2943,7 @@ async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Pin a message in a chat.
@@ -2760,6 +2962,7 @@ async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Unpin a message in a chat.
@@ -2778,6 +2981,7 @@ async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def mark_as_read(chat_id: Union[int, str]) -> str:
     """
     Mark all messages as read in a chat.
@@ -2794,6 +2998,7 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Reply To Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str) -> str:
     """
     Reply to a specific message in a chat.
@@ -2812,6 +3017,7 @@ async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str)
     annotations=ToolAnnotations(title="Get Media Info", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
     """
     Get info about media in a message.
@@ -2835,6 +3041,7 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Search Public Chats", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def search_public_chats(query: str) -> str:
     """
     Search for public chats, channels, or bots by username or title.
@@ -2850,6 +3057,7 @@ async def search_public_chats(query: str) -> str:
     annotations=ToolAnnotations(title="Search Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
     Search for messages in a chat by text.
@@ -2877,6 +3085,7 @@ async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20)
 @mcp.tool(
     annotations=ToolAnnotations(title="Resolve Username", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def resolve_username(username: str) -> str:
     """
     Resolve a username to a user or chat ID.
@@ -2894,6 +3103,7 @@ async def resolve_username(username: str) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def mute_chat(chat_id: Union[int, str]) -> str:
     """
     Mute notifications for a chat.
@@ -2937,6 +3147,7 @@ async def mute_chat(chat_id: Union[int, str]) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def unmute_chat(chat_id: Union[int, str]) -> str:
     """
     Unmute notifications for a chat.
@@ -2980,6 +3191,7 @@ async def unmute_chat(chat_id: Union[int, str]) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def archive_chat(chat_id: Union[int, str]) -> str:
     """
     Archive a chat.
@@ -3001,6 +3213,7 @@ async def archive_chat(chat_id: Union[int, str]) -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def unarchive_chat(chat_id: Union[int, str]) -> str:
     """
     Unarchive a chat.
@@ -3019,6 +3232,7 @@ async def unarchive_chat(chat_id: Union[int, str]) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Sticker Sets", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def get_sticker_sets() -> str:
     """
     Get all sticker sets.
@@ -3034,6 +3248,7 @@ async def get_sticker_sets() -> str:
     annotations=ToolAnnotations(title="Send Sticker", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
     """
     Send a sticker to a chat. File must be a valid .webp sticker file.
@@ -3060,6 +3275,7 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Gif Search", openWorldHint=True, readOnlyHint=True)
 )
+@acl_guard
 async def get_gif_search(query: str, limit: int = 10) -> str:
     """
     Search for GIFs by query. Returns a list of Telegram document IDs (not file paths).
@@ -3117,6 +3333,7 @@ async def get_gif_search(query: str, limit: int = 10) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Send Gif", openWorldHint=True, destructiveHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def send_gif(chat_id: Union[int, str], gif_id: int) -> str:
     """
     Send a GIF to a chat by Telegram GIF document ID (not a file path).
@@ -3136,6 +3353,7 @@ async def send_gif(chat_id: Union[int, str], gif_id: int) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Bot Info", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def get_bot_info(bot_username: str) -> str:
     """
     Get information about a bot by username.
@@ -3176,6 +3394,7 @@ async def get_bot_info(bot_username: str) -> str:
         title="Set Bot Commands", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def set_bot_commands(bot_username: str, commands: list) -> str:
     """
     Set bot commands for a bot you own.
@@ -3224,6 +3443,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get History", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@acl_guard
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
     Get full chat history (up to limit).
@@ -3250,6 +3470,7 @@ async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     annotations=ToolAnnotations(title="Get User Photos", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("user_id")
+@acl_guard
 async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
     """
     Get profile photos of a user.
@@ -3268,6 +3489,7 @@ async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
     annotations=ToolAnnotations(title="Get User Status", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("user_id")
+@acl_guard
 async def get_user_status(user_id: Union[int, str]) -> str:
     """
     Get the online status of a user.
@@ -3283,6 +3505,7 @@ async def get_user_status(user_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Recent Actions", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_recent_actions(chat_id: Union[int, str]) -> str:
     """
     Get recent admin actions (admin log) in a group or channel.
@@ -3314,6 +3537,7 @@ async def get_recent_actions(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Pinned Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_pinned_messages(chat_id: Union[int, str]) -> str:
     """
     Get all pinned messages in a chat.
@@ -3354,6 +3578,7 @@ async def get_pinned_messages(chat_id: Union[int, str]) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(title="Create Poll", openWorldHint=True, destructiveHint=True)
 )
+@acl_guard
 async def create_poll(
     chat_id: int,
     question: str,
@@ -3432,6 +3657,7 @@ async def create_poll(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def send_reaction(
     chat_id: Union[int, str],
     message_id: int,
@@ -3475,6 +3701,7 @@ async def send_reaction(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def remove_reaction(
     chat_id: Union[int, str],
     message_id: int,
@@ -3507,6 +3734,7 @@ async def remove_reaction(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def get_message_reactions(
     chat_id: Union[int, str],
     message_id: int,
@@ -3583,6 +3811,7 @@ async def get_message_reactions(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def save_draft(
     chat_id: Union[int, str],
     message: str,
@@ -3625,6 +3854,7 @@ async def save_draft(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Drafts", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def get_drafts() -> str:
     """
     Get all draft messages across all chats.
@@ -3687,6 +3917,7 @@ async def get_drafts() -> str:
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def clear_draft(chat_id: Union[int, str]) -> str:
     """
     Clear/delete a draft from a specific chat.
@@ -3717,6 +3948,7 @@ async def clear_draft(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Folders", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def list_folders() -> str:
     """
     Get all dialog folders (filters) with their IDs, names, and emoji.
@@ -3766,6 +3998,7 @@ async def list_folders() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Folder", openWorldHint=True, readOnlyHint=True))
+@acl_guard
 async def get_folder(folder_id: int) -> str:
     """
     Get detailed information about a specific folder including all included chats.
@@ -3869,6 +4102,7 @@ async def get_folder(folder_id: int) -> str:
         title="Create Folder", openWorldHint=True, destructiveHint=True, idempotentHint=False
     )
 )
+@acl_guard
 async def create_folder(
     title: str,
     emoticon: Optional[str] = None,
@@ -3970,6 +4204,7 @@ async def create_folder(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def add_chat_to_folder(
     folder_id: int, chat_id: Union[int, str], pinned: bool = False
 ) -> str:
@@ -4063,6 +4298,7 @@ async def add_chat_to_folder(
     )
 )
 @validate_id("chat_id")
+@acl_guard
 async def remove_chat_from_folder(folder_id: int, chat_id: Union[int, str]) -> str:
     """
     Remove a chat from a folder.
@@ -4158,6 +4394,7 @@ async def remove_chat_from_folder(folder_id: int, chat_id: Union[int, str]) -> s
         title="Delete Folder", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def delete_folder(folder_id: int) -> str:
     """
     Delete a folder. Chats in the folder are preserved, only the folder is removed.
@@ -4202,6 +4439,7 @@ async def delete_folder(folder_id: int) -> str:
         title="Reorder Folders", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@acl_guard
 async def reorder_folders(folder_ids: List[int]) -> str:
     """
     Change the order of folders in the folder list.
@@ -4241,6 +4479,17 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 
 async def _main() -> None:
     try:
+        # Optional dry-run mode: start MCP server without connecting/authing to Telegram.
+        # Useful for environment/proxy/profile validation and schema inspection.
+        # NOTE: Most tools require an authenticated client; in dry-run they may fail.
+        dry_run = os.getenv("TG_MCP_DRY_RUN") or os.getenv("TELEGRAM_MCP_DRY_RUN")
+        if dry_run and dry_run.strip().lower() in ("1", "true", "yes", "y", "on"):
+            print(
+                "TG_MCP_DRY_RUN enabled: skipping Telegram client.start(); running MCP server only..."
+            )
+            await mcp.run_stdio_async()
+            return
+
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
         await client.start()
