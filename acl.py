@@ -9,6 +9,7 @@ acl_check(policy, tool, sender_id, target_chat_id=None) -> AclResult
 handle_group_message(policy, chat_id, sender_id, text)   -> Optional[str]
 resolve_alias(policy, alias)                             -> int
 load_policy(path=None)                                   -> dict
+check_command_prefix(policy, text)                       -> bool
 """
 
 from __future__ import annotations
@@ -16,10 +17,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rate-limit state for unknown-sender group replies (PRD §10 Q2)
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_DEFAULT: int = 86400  # 24 hours
+_unknown_reply_times: dict[tuple[int, int], float] = {}
 
 # ---------------------------------------------------------------------------
 # Tool classification sets (PRD §7.3 + acl-enforcement.md)
@@ -149,10 +157,13 @@ BROAD_READ_TOOLS: frozenset[str] = frozenset(
 # (proxy enabled/type/host/port, no credentials).  If the MCP transport layer
 # is unauthenticated this leaks reconnaissance data; move to ACT_TOOLS and
 # gate behind ADMIN if that becomes a concern.
+# reload_policy: re-reads secrets/policy.json; must not be gated itself
+# (chicken-and-egg after revocation).
 SELF_TOOLS: frozenset[str] = frozenset(
     {
         "get_me",
         "get_runtime_config",
+        "reload_policy",
     }
 )
 
@@ -277,7 +288,7 @@ def acl_check(
     checks (enforce kill-switch, self-tools, unknown-sender deny).
     """
     # 1. Enforcement kill-switch
-    if not policy.get("enforce", False):
+    if not policy.get("enforce", True):
         return AclResult(allowed=True, reason="enforcement disabled")
 
     # 2. Self-info tools — always allowed
@@ -316,8 +327,10 @@ def handle_group_message(
 ) -> Optional[str]:
     """Return a fixed reply string if the sender should be short-circuited.
 
-    Returns None → normal processing (ADMIN / trusted contact).
-    Returns str  → send this reply, call no tools.
+    Returns None  → normal processing (ADMIN / trusted contact).
+    Returns str   → send this reply, call no tools.  Non-empty = not yet sent;
+                    caller is responsible for sending it.
+    Returns ""    → rate-limited; caller must stay silent.
     """
     # Not one of our groups → ignore entirely
     if not _is_allowed_chat(policy, chat_id):
@@ -326,6 +339,14 @@ def handle_group_message(
     role = _classify_sender(policy, sender_id)
     if role in ("ADMIN", "TRUSTED"):
         return None
+
+    # Rate-limit: one reply per (chat, sender) per rate_limit window
+    now = time.time()
+    rate_limit = policy.get("unknown_reply_rate_limit_secs", _RATE_LIMIT_DEFAULT)
+    key = (chat_id, sender_id)
+    if key in _unknown_reply_times and (now - _unknown_reply_times[key]) < rate_limit:
+        return ""  # rate-limited — caller must NOT send anything
+    _unknown_reply_times[key] = now
 
     return policy.get(
         "unknown_group_reply",
@@ -348,6 +369,18 @@ def resolve_alias(policy: dict, alias: str) -> int:
         if contact.get("alias") == alias:
             return int(uid_str)
     raise ValueError(f"No trusted contact with alias {alias!r}")
+
+
+def check_command_prefix(policy: dict, text: str) -> bool:
+    """Return True if *text* starts with an allowed command prefix.
+
+    If ``command_prefixes`` is missing or empty the gate is considered open
+    (no prefix required) and the function returns True unconditionally.
+    """
+    prefixes = policy.get("command_prefixes", [])
+    if not prefixes:
+        return True
+    return any(text.strip().startswith(p) for p in prefixes)
 
 
 # ---------------------------------------------------------------------------
