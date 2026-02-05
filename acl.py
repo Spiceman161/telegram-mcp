@@ -10,6 +10,7 @@ handle_group_message(policy, chat_id, sender_id, text)   -> Optional[str]
 resolve_alias(policy, alias)                             -> int
 load_policy(path=None)                                   -> dict
 check_command_prefix(policy, text)                       -> bool
+needs_command_prefix(tool, **kwargs)                     -> bool
 """
 
 from __future__ import annotations
@@ -157,13 +158,59 @@ BROAD_READ_TOOLS: frozenset[str] = frozenset(
 # (proxy enabled/type/host/port, no credentials).  If the MCP transport layer
 # is unauthenticated this leaks reconnaissance data; move to ACT_TOOLS and
 # gate behind ADMIN if that becomes a concern.
-# reload_policy: re-reads secrets/policy.json; must not be gated itself
-# (chicken-and-egg after revocation).
 SELF_TOOLS: frozenset[str] = frozenset(
     {
         "get_me",
         "get_runtime_config",
-        "reload_policy",
+    }
+)
+
+# ACL-management tools — require ADMIN + command prefix.
+# reload_policy: re-reads secrets/policy.json.  Gated behind ACL so that
+# only ADMIN can trigger it; if locked out, restart the daemon (re-reads
+# policy from disk on startup).
+ACL_TOOLS: frozenset[str] = frozenset({"reload_policy"})
+
+# FILES tools that are inherently media-safe (no arbitrary file exfiltration).
+MEDIA_EXEMPT_FILES: frozenset[str] = frozenset(
+    {
+        "send_voice",  # always audio
+        "get_user_photos",  # always images
+        "get_media_info",  # metadata only
+        "download_media",  # read-only download, not exfiltration
+    }
+)
+
+_MEDIA_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        # Images
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".svg",
+        ".tiff",
+        ".heic",
+        ".heif",
+        # Audio
+        ".mp3",
+        ".ogg",
+        ".opus",
+        ".wav",
+        ".flac",
+        ".aac",
+        ".m4a",
+        ".wma",
+        # Video
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".webm",
+        ".mkv",
+        ".flv",
+        ".wmv",
     }
 )
 
@@ -188,6 +235,8 @@ def _classify_tool(tool: str) -> str:
     """Return capability label for a tool name."""
     if tool in ACT_TOOLS:
         return "ACT"
+    if tool in ACL_TOOLS:
+        return "ACL"
     if tool in FILES_TOOLS:
         return "FILES"
     if tool in WRITE_TOOLS:
@@ -250,10 +299,10 @@ def _check_trusted(
     policy: dict, capability: str, sender_id: int, target_chat_id: Optional[int]
 ) -> AclResult:
     """TRUSTED sender branch of the decision matrix."""
-    if capability in ("ACT", "FILES"):
+    if capability in ("ACT", "FILES", "ACL"):
         return AclResult(
             allowed=False,
-            reason="ACT/FILES not allowed for trusted contacts",
+            reason="ACT/FILES/ACL not allowed for trusted contacts",
         )
 
     if capability == "BROAD_READ":
@@ -381,6 +430,35 @@ def check_command_prefix(policy: dict, text: str) -> bool:
     if not prefixes:
         return True
     return any(text.strip().startswith(p) for p in prefixes)
+
+
+def needs_command_prefix(tool: str, **kwargs) -> bool:
+    """Return True if *tool* requires a verified command prefix.
+
+    Prefix is required for:
+    - ACT_TOOLS (dangerous state-changing operations)
+    - ACL_TOOLS (policy management)
+    - FILES_TOOLS **except** media-exempt tools and ``send_file`` with
+      a media extension (images, audio, video).
+
+    Everything else (WRITE, BROAD_READ, NARROW_READ, SELF) works
+    without a prefix.
+    """
+    if tool in ACT_TOOLS:
+        return True
+    if tool in ACL_TOOLS:
+        return True
+    if tool in FILES_TOOLS:
+        if tool in MEDIA_EXEMPT_FILES:
+            return False
+        if tool == "send_file":
+            file_path = kwargs.get("file_path", "")
+            if not file_path:
+                return True
+            _, ext = os.path.splitext(file_path)
+            return ext.lower() not in _MEDIA_EXTENSIONS
+        return True  # unknown FILES tool — require prefix
+    return False
 
 
 # ---------------------------------------------------------------------------

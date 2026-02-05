@@ -45,11 +45,19 @@ from acl import (
     load_policy as _load_policy,
     acl_check as _acl_check,
     check_file_size as _check_file_size,
+    check_command_prefix as _check_command_prefix,
+    needs_command_prefix as _needs_command_prefix,
 )
 
 _current_sender_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "telegram_mcp.sender_id", default=None
 )
+
+# --- Command-prefix verification state (PRD §6.2) ---
+# Module-level dict (not ContextVar) because MCP daemon is single-process
+# sequential.  TTL prevents stale prefix from authorising later calls.
+_prefix_state: dict = {"verified": False, "timestamp": 0.0}
+_PREFIX_TTL: float = 60.0  # seconds
 
 
 class ValidationError(Exception):
@@ -388,23 +396,6 @@ def get_runtime_config() -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-@mcp.tool()
-def reload_policy() -> str:
-    """Re-read the ACL policy file from disk.
-
-    SELF_TOOL: no @acl_guard, no target required.  Updates _acl_policy and
-    _acl_default_sender so that revocations take effect without a daemon restart.
-    """
-    global _acl_policy, _acl_default_sender
-    _acl_policy = _load_policy()
-    _acl_default_sender = _acl_policy.get("admin_user_ids", [None])[0]
-    _acl_logger.info(
-        "policy_reloaded",
-        extra={"event": "policy_reloaded"},
-    )
-    return "ACL policy reloaded."
-
-
 # Error code prefix mapping for better error tracing
 class ErrorCategory(str, Enum):
     CHAT = "CHAT"
@@ -599,6 +590,29 @@ def acl_guard(func):
                 extra={"event": "acl_enforcement_disabled", "tool": func.__name__},
             )
 
+        # --- Prefix verification (PRD §6.2) ---
+        if _needs_command_prefix(func.__name__, **kwargs):
+            now = time.time()
+            if (
+                not _prefix_state["verified"]
+                or (now - _prefix_state["timestamp"]) > _PREFIX_TTL
+            ):
+                _acl_logger.info(
+                    "acl_decision",
+                    extra={
+                        "event": "acl_decision",
+                        "tool": func.__name__,
+                        "sender_id": sender_id,
+                        "allowed": False,
+                        "reason": "prefix_required",
+                    },
+                )
+                return (
+                    "[PREFIX REQUIRED] This tool requires a command "
+                    "prefix. Call set_command_context first with "
+                    "the user's message text."
+                )
+
         # Extract target from kwargs by priority.
         # validate_id (if present) has already converted numeric strings to int.
         # A remaining str value is a Telegram username; acl_check compares against
@@ -674,6 +688,66 @@ def acl_guard(func):
         return await func(*args, **kwargs)
 
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+# ACL / prefix tools — placed after acl_guard definition to avoid NameError
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@acl_guard
+async def reload_policy() -> str:
+    """Re-read the ACL policy file from disk.
+
+    ACL_TOOL: requires ADMIN + command prefix.  If locked out, restart the
+    daemon (re-reads policy from disk on startup).  Updates _acl_policy and
+    _acl_default_sender so that revocations take effect without a restart.
+    """
+    global _acl_policy, _acl_default_sender
+    _acl_policy = _load_policy()
+    _acl_default_sender = _acl_policy.get("admin_user_ids", [None])[0]
+    _acl_logger.info(
+        "policy_reloaded",
+        extra={"event": "policy_reloaded"},
+    )
+    return "ACL policy reloaded."
+
+
+@mcp.tool()
+async def set_command_context(message_text: str) -> str:
+    """Verify and store a command prefix for subsequent tool calls.
+
+    Claude should call this FIRST when the user message contains a command
+    prefix (e.g. ``/clawtg ban user X``).  The verified flag expires after
+    60 seconds so it cannot be reused across unrelated requests.
+
+    Returns a JSON object with ``verified`` (bool) and ``prefix_found`` (str
+    or null).
+    """
+    verified = _check_command_prefix(_acl_policy, message_text)
+    _prefix_state["verified"] = verified
+    _prefix_state["timestamp"] = time.time()
+    prefix_found = None
+    if verified:
+        prefixes = _acl_policy.get("command_prefixes", [])
+        stripped = message_text.strip()
+        for p in prefixes:
+            if stripped.startswith(p):
+                prefix_found = p
+                break
+    _acl_logger.info(
+        "command_context_set",
+        extra={
+            "event": "command_context_set",
+            "verified": verified,
+            "prefix_found": prefix_found,
+        },
+    )
+    return json.dumps(
+        {"verified": verified, "prefix_found": prefix_found},
+        ensure_ascii=False,
+    )
 
 
 def format_entity(entity) -> Dict[str, Any]:
