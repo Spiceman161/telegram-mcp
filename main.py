@@ -97,6 +97,7 @@ mcp = FastMCP("telegram")
 
 # --- Optional network + client profile settings (env-driven) ---
 # Proxy env:
+#   TG_PROXY_ENABLED=true|false (default true; false = direct connection)
 #   TG_PROXY_TYPE=socks5|socks4|http
 #   TG_PROXY_HOST, TG_PROXY_PORT
 #   TG_PROXY_USER, TG_PROXY_PASS (optional)
@@ -131,6 +132,9 @@ def build_proxy():
         (proxy_type, addr, port, rdns, username, password)
       where proxy_type is usually an int constant from the `socks` module.
     """
+
+    if not _env_bool("TG_PROXY_ENABLED", default=True):
+        return None
 
     ptype_raw = (os.getenv("TG_PROXY_TYPE") or "").strip().lower()
     if not ptype_raw:
@@ -236,6 +240,12 @@ if _proxy:
     print(f"Proxy: {_ptype} {_host}:{_port} rdns={bool(_rdns)} user={'yes' if _user else 'no'}")
 else:
     print("Proxy: disabled")
+    if not _env_bool("TG_PROXY_ENABLED", default=True):
+        print(
+            "WARNING: TG_PROXY_ENABLED=false -- direct connection mode. "
+            "Your real IP is visible to Telegram servers.",
+            file=sys.stderr,
+        )
 
 print(
     "Client profile: "
